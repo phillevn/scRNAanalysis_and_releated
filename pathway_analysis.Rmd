@@ -1,0 +1,137 @@
+---
+title: "Pathway analysis"
+output: html_notebook
+---
+
+In this note, we are working on Pathway analysis. Before to run this note, we need to run the file single_cell_type_annotation.Rmd for getting results from DESeq2 for single cell clusters.
+
+Need to install some packages if not installed.
+
+```{r}
+# install gage
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install(c("gage","GO.db","AnnotationDbi","org.Hs.eg.db"), version = "3.8")
+```
+
+```{r}
+library(gage)
+```
+
+Here is the results from the previous work
+
+```{r}
+stim_vs_ctrl_res_DESeq2 <- results(dds, 
+               contrast = contrast,
+               alpha = 0.05)
+```
+
+# setting up gene set databases
+
+In order to perform our pathway analysis we need a list of pathways and their respective genes. The most common databases for this type of data are KEGG and GO. The gage package has two functions for querying this information in real time, kegg.gsets() and go.gsets(), both of which take a species as an argument and will return a list of gene sets and some helpful meta information for subsetting these list. For the KEGG database object kg.hsa\$kg.sets stores all gene sets for the queried species; kg.hsa\$sigmet.idx and kg.hsa$dise.idx store the indices for those gene sets which are classified as signaling and metabolism and disease respectively. We use this information to extract a list of gene sets for the signaling and metabolism and disease subsets. A similar process is used for the GO gene sets splitting the master gene set into the three gene ontologies: “Biological Process”, “Molecular Function”, and “Cellular Component”.
+
+```{r}
+# set up kegg database
+kg.hsa <- kegg.gsets(species="hsa")
+kegg.sigmet.gs <- kg.hsa$kg.sets[kg.hsa$sigmet.idx]
+kegg.dise.gs <- kg.hsa$kg.sets[kg.hsa$dise.idx]
+
+# set up go database
+# go.hs <- go.gsets(species="human")
+# go.bp.gs <- go.hs$go.sets[go.hs$go.subs$BP]
+# go.mf.gs <- go.hs$go.sets[go.hs$go.subs$MF]
+# go.cc.gs <- go.hs$go.sets[go.hs$go.subs$CC]
+```
+
+
+# annotating genes
+
+We have our gene sets now however if you look at one of these objects containing the gene sets you’ll notice that each gene set contains a series of integers. These integers are actually entrez gene identifiers which presents a problem as our DESeq2 results use ensemble ID’s as gene identifiers. We will need to convert our gene identifiers to the same format before we perform the pathway analysis. Fortunately bioconductor maintains genome wide annotation data for many species, you can view these species with the OrgDb bioc view. This makes converting the gene identifiers relatively straight forward, below we use the mapIds() function to query the OrganismDb object for the gene symbol, entrez id, and gene name based on the ensembl id. Because there might not be a one to one relationship with these identifiers we also use multiVals="first" to specify that only the first identifier should be returned in such cases.
+
+```{r}
+# load in libraries to annotate data
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+# annotate the deseq2 results with additional gene identifiers
+# stim_vs_ctrl_res_DESeq2$symbol <- mapIds(org.Hs.eg.db, keys=row.names(stim_vs_ctrl_res_DESeq2), column="SYMBOL", keytype="ENSEMBL", multiVals="first")
+# stim_vs_ctrl_res_DESeq2$entrez <- mapIds(org.Hs.eg.db, keys=row.names(stim_vs_ctrl_res_DESeq2), column="ENTREZID", keytype="ENSEMBL", multiVals="first")
+# stim_vs_ctrl_res_DESeq2$name <- mapIds(org.Hs.eg.db, keys=row.names(stim_vs_ctrl_res_DESeq2), column="GENENAME", keytype="ENSEMBL", multiVals="first")
+
+stim_vs_ctrl_res_DESeq2$symbol <- row.names(stim_vs_ctrl_res_DESeq2)
+```
+```{r}
+stim_vs_ctrl_res_DESeq2.lfc <- stim_vs_ctrl_res_DESeq2$log2FoldChange
+
+names(stim_vs_ctrl_res_DESeq2.lfc) <- row.names(stim_vs_ctrl_res_DESeq2)
+```
+
+
+Convert to entrez ids
+
+```{r}
+data(egSymb)
+con_entrez <- sym2eg(row.names(stim_vs_ctrl_res_DESeq2))
+names(stim_vs_ctrl_res_DESeq2.lfc) <- con_entrez
+```
+
+```{r}
+fc.kegg.sigmet.p <- gage(stim_vs_ctrl_res_DESeq2.lfc, gsets = kegg.sigmet.gs)
+fc.kegg.dise.p <- gage(stim_vs_ctrl_res_DESeq2.lfc, gsets = kegg.dise.gs)
+```
+
+
+## Convert the results to dataframe by up or down
+
+```{r}
+# covert the kegg results to data frames
+fc.kegg.sigmet.p.up <- as.data.frame(fc.kegg.sigmet.p$greater)
+fc.kegg.dise.p.up <- as.data.frame(fc.kegg.dise.p$greater)
+
+fc.kegg.sigmet.p.down <- as.data.frame(fc.kegg.sigmet.p$less)
+fc.kegg.dise.p.down <- as.data.frame(fc.kegg.dise.p$less)
+
+```
+
+```{r}
+library(pathview)
+# View the hsa04060  pathway from the pathway analysis
+fc.kegg.sigmet.p.up[grepl("hsa03460 ", rownames(fc.kegg.sigmet.p.up), fixed=TRUE),]
+
+# Overlay the expression data onto this pathway
+pathview(gene.data=tumor_v_normal_DE.fc, species="hsa", pathway.id="hsa03460")
+```
+```{r}
+# View the hsa03430 pathway from the pathway analysis
+fc.kegg.sigmet.p.up[grepl("hsa03460", rownames(fc.kegg.sigmet.p.up), fixed=TRUE),]
+
+# Overlay the expression data onto this pathway
+pathview(gene.data=tumor_v_normal_DE.fc, species="hsa", pathway.id="hsa03460", kegg.native=FALSE)
+```
+
+
+## Test
+
+```{r}
+load(url("http://genomedata.org/gen-viz-workshop/intro_to_deseq2/tutorial/deseq2Data_v1.RData"))
+```
+```{r}
+tumor_v_normal_DE <- results(deseq2Data, contrast=c("tissueType", "primary colorectal cancer", "normal-looking surrounding colonic epithelium"))
+```
+```{r}
+# annotate the deseq2 results with additional gene identifiers
+tumor_v_normal_DE$symbol <- mapIds(org.Hs.eg.db, keys=row.names(tumor_v_normal_DE), column="SYMBOL", keytype="ENSEMBL", multiVals="first")
+tumor_v_normal_DE$entrez <- mapIds(org.Hs.eg.db, keys=row.names(tumor_v_normal_DE), column="ENTREZID", keytype="ENSEMBL", multiVals="first")
+tumor_v_normal_DE$name <- mapIds(org.Hs.eg.db, keys=row.names(tumor_v_normal_DE), column="GENENAME", keytype="ENSEMBL", multiVals="first")
+```
+```{r}
+# grab the log fold changes for everything
+tumor_v_normal_DE.fc <- tumor_v_normal_DE$log2FoldChange
+names(tumor_v_normal_DE.fc) <- tumor_v_normal_DE$entrez
+```
+```{r}
+# Run enrichment analysis on all log fc
+t_fc.kegg.sigmet.p <- gage(tumor_v_normal_DE.fc, gsets = kegg.sigmet.gs)
+t_fc.kegg.dise.p <- gage(tumor_v_normal_DE.fc, gsets = kegg.dise.gs)
+```
+

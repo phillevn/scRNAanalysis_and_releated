@@ -1,0 +1,662 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Colonrectal cancer project: reproduce GSE149224 https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7486130/
+
+```{r, include= FALSE}
+library(tidyverse)
+library(ggplot2)
+library(scater) # for QC purpose
+library(SingleCellExperiment)
+library(SingleR)
+```
+
+
+```{r}
+count <- read.delim(gzfile("D:\\scRNAseq\\GSE149224_RSH.all.counts.txt.gz"), sep = " ")
+count
+
+```
+
+```{r}
+# count_2 <- read.delim(gzfile("D:\\scRNAseq\\GSE149224_RSH.all.txt.gz"), sep = " ")
+
+```
+```{r}
+annot <- read.delim(gzfile("D:\\scRNAseq\\GSE149224_meta.information.csv.gz"), sep = ",")
+annot <- annot %>% unite(batch_gid_dose, c(batch, df.gid,dose), sep = "_", remove = FALSE)
+annot
+```
+```{r}
+unique(annot$df.gid)
+```
+
+
+```{r}
+gene_names <- rownames(count)
+unique(length(gene_names))
+```
+
+# Convert gene symbols to entrez
+
+```{r, include=FALSE}
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(gage)
+data(egSymb)
+con_entrez <- sym2eg(gene_names)
+sum(is.na(con_entrez))
+```
+```{r}
+library("EnsDb.Hsapiens.v86")
+
+mapIds_entrezid <- mapIds(EnsDb.Hsapiens.v86, keys = gene_names, keytype = "GENENAME", columns = c("ENTREZID"))
+mapIds_GENEID <- mapIds(EnsDb.Hsapiens.v86, keys = gene_names, keytype = "GENENAME", columns = c("GENEID"))
+
+
+```
+
+
+
+```{r}
+crc_dat <- SingleCellExperiment(
+  assays = list(counts = as.matrix(count)),
+  colData = annot
+)
+crc_dat
+```
+# After we create our single cell object, we remove variables that we don't use later for memnory saving purpose since rnaseq file are huge in most cases. We use rm() command to do that job
+
+```{r}
+rm(count)
+rm(annot)
+```
+
+# We, we create a log2 transform assay for our scRNA object
+
+```{r}
+assay(crc_dat, "log2counts") <- log2(counts(crc_dat) + 1)
+```
+
+# We take a peek on the coldata information. coldata has information of the RNA transcript and related information to the experiment of samples
+
+```{r}
+crc_dat@colData
+```
+# Next, we look at the mean and total counts for each gene by creating those columns in colData of our single cell object
+
+```{r}
+colData(crc_dat)$mean <- colMeans(counts(crc_dat))
+colData(crc_dat)$total_count <- colCounts(counts(crc_dat))
+
+# Making another assay cpm
+assay(crc_dat, "cpm") <- counts(crc_dat)/crc_dat$total_count/1e6 # Count for cell per million
+
+
+
+```
+# We transform column that need to be factor data into factor
+
+```{r}
+colData(crc_dat)$batch <- factor(colData(crc_dat)$batch)
+colData(crc_dat)$df.gid <- factor(colData(crc_dat)$df.gid)
+colData(crc_dat)$batch_gid_dose <- factor(colData(crc_dat)$batch_gid_dose)
+
+cell_info <- as.data.frame(colData(crc_dat))
+
+colData(crc_dat)
+```
+
+
+# Now, we will take a look at the violin plot of total count per batch and dose and df.gid
+
+```{r}
+ggplot(data = cell_info, aes(x = batch_gid_dose, y = total_count)) +
+  geom_violin(fill = 'brown') + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+# Normally, if your gene names are in ENS format, we may need to convert to symbols so we can easily to do gene annotation later for gene set analysis or pathway analysis. However, we already provided genes in symbol format, we don't need to do further
+
+Let’s check if we can find mitochondrial proteins in the newly annotated symbols. Mitochrondial is an essential part of QC since if its proportion is too large (more than 10%, usually) then the data is not good to use
+
+
+# Our data given symbols for gene names, we may want to convert to other types for later use if needed. Here, I converted to entrezid and geneid
+
+```{r}
+rowData(crc_dat)$SYMBOL <- gene_names
+rowData(crc_dat)$entrezid <- mapIds_entrezid
+rowData(crc_dat)$geneid <- mapIds_GENEID
+
+```
+
+# We can check mitochrondial in our sequence
+
+```{r}
+mito_names <- grep("^MT-",rowData(crc_dat)$SYMBOL,value = T)
+mito_names
+```
+# And find ribosomal proteins if you want (high proportion of ribosomal proteins may indicate that cells are dying/dead)
+
++ Similar command to find ribosomal proteins (which start with RPL or RPS) works as expected:
+```{r}
+ribo_names <- grep("^RP[LS]",rowData(crc_dat)$SYMBOL,value = T)
+ribo_names
+```
+
+Quick search for mitochondrial protein ATP8, which is also called MT-ATP8
+
+```{r}
+grep("*ATP8",rowData(crc_dat)$SYMBOL,value = T)
+```
+
+# It is time for us to take a look at more details of the data and do some QC for the dataset.
+
+## We do some visualization regarding number of cells, percentage, ...
++The following scater functions allow us to add per-cell and per-gene metrics useful for dataset evaluation. Most popular metrics per cell are total number of counts (UMIs), total number of detected genes, total number of mitochondrial counts, percent of mitochondrial counts, etc.
+
+# First, we look at the counts and percentage of each groups correspoding to dose of treatments
+
+```{r}
+df_plot <- data.frame(dose = factor(crc_dat@colData$dose), group = factor(crc_dat@colData$batch_gid_dose))
+
+df_plot %>% 
+  	ggplot(aes(x=dose, fill=group)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+```
+
+# And the density distribution of each batch for dose, gid and batch
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+data.frame(batch_gid_dose = crc_dat@colData$batch_gid_dose, total_count = crc_dat@colData$total_count) %>%
+  	ggplot(aes(color=batch_gid_dose, x=total_count, fill= batch_gid_dose)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 500)
+```
+# Now, we just take a closer look at the percentage of Mitochrondial cells and ribosomal proteins percentage
+
+```{r}
+crc_dat_Mitocell <- perCellQCMetrics(crc_dat,subsets=list(Mito=mito_names))
+
+crc_dat_ribocell <- perCellQCMetrics(crc_dat,subsets=list(Ribo=ribo_names))
+crc_dat_feature <- perFeatureQCMetrics(crc_dat)
+```
+
++ If you want to modify the colData by adding those information, we can use the following way
+
+```{r}
+crc_dat <- addPerCellQC(crc_dat, subsets=list(Mito=mito_names))
+crc_dat <- addPerCellQC(crc_dat, subsets=list(Ribo=ribo_names))
+
+names(colData(crc_dat))
+```
+# And the table of colData
+
+```{r}
+data.frame(crc_dat@colData)
+```
+# Or we can see them separately if we use the separate results
+
+# Mitochrondial percentage
+
+```{r}
+crc_dat_Mitocell
+```
+# Ribosomal percentage
+
+```{r}
+crc_dat_ribocell
+```
+
+# Find low-quality cells
+
+We then identify cells that are outliers for the various QC metrics, based on the median absolute deviation (MAD) from the median value of each metric across all cells. Specifically, a value is considered an outlier if it is more than 3 MADs from the median in the “problematic” direction. This is loosely motivated by the fact that such a filter will retain 99% of non-outlier values that follow a normal distribution.
+
+## Identify outliers
+
++ Find cell that has outside the 3MAD from median for mitochrondial 
+
+```{r}
+mito_sum_low <- isOutlier(crc_dat_Mitocell$sum, log=TRUE, type="lower")
+```
+
+```{r}
+mito_detect_high <- isOutlier(crc_dat_Mitocell$detected, log=TRUE, type="higher")
+```
+
++ Check the finding outliers
+
+```{r}
+attr(mito_sum_low, "thresholds")
+```
+```{r}
+attr(mito_detect_high, "thresholds")
+```
++ Find the cutoff for percentage for mito 
+```{r}
+mito_per <- isOutlier(crc_dat_Mitocell$subsets_Mito_percent, type="higher")
+attr(mito_per, "thresholds")
+```
++ We remove the outliers and summary what we did
+
+```{r}
+# We take all the ones that does not satistfy criterions by removing low size library, highe detected library and high percentage of mitochrondial 
+
+mito_discard <- mito_detect_high | mito_sum_low | mito_per 
+
+# Summarize the number of cells removed for each reason.
+DataFrame(LibSize=sum(mito_sum_low), NExprs=sum(mito_detect_high),
+     MitoProp=sum(mito_per), Total=sum(mito_discard))
+```
++ Another way to do the tasks above
+
+```{r}
+reasons <- quickPerCellQC(crc_dat_Mitocell, 
+    sub.fields=c("subsets_Mito_percent"))
+colSums(as.matrix(reasons))
+```
++ Do some visualization
+
+```{r}
+# colData(crc_dat) <- cbind(colData(crc_dat), crc_dat_Mitocell)
+# crc_dat$batch <- factor(crc_dat$batch)
+crc_dat$discard <- mito_discard
+data.frame(crc_dat@colData)
+```
+# Now, we take a look at the cells that we may remove by some features
+
++ By df.gid
+
+```{r}
+ plotColData(crc_dat, x="batch", y="sum", colour_by="discard",
+        other_fields="df.gid") + facet_wrap(~df.gid, nrow = 4) + 
+        scale_y_log10() + ggtitle("Total count")
+```
++ By dose
+
+```{r}
+
+ plotColData(crc_dat, x="batch", y="sum", colour_by="discard",
+        other_fields="dose") + facet_wrap(~dose, nrow = 4) + 
+        scale_y_log10() + ggtitle("Total count")
+```
+
+
+
+# Subset the data base on discard criteria
+
+```{r}
+
+crc_dat_filter <- subset(x = crc_dat, select = (discard == FALSE))
+```
++ Before the discard
+
+```{r}
+crc_dat
+```
+```{r}
+# saveRDS(crc_dat, file = "D:\\scRNAseq\\crc_dat.rds")
+# saveRDS(crc_dat_filter, file = "D:\\scRNAseq\\crc_dat_filter.rds")
+```
+
+# Load dataset that we save above
+
+```{r, include=FALSE}
+crc_dat <- readRDS("D:\\scRNAseq\\crc_dat.rds")
+crc_dat_filter <- readRDS("D:\\scRNAseq\\crc_dat_filter.rds")
+```
+
+# Normalization by using librarySizeFactors from scater package
+
+```{r}
+library(scater)
+lib.crc_dat_filter <- librarySizeFactors(crc_dat_filter)
+summary(lib.crc_dat_filter)
+```
+# Histogram of the normalization
+
+```{r}
+hist(log10(lib.crc_dat_filter), xlab="Log10[Size factor]", col='grey80')
+```
+# Normalization by deconvolution
+
+```{r}
+library(scran)
+set.seed(100)
+clust.crc_dat_filter <- quickCluster(crc_dat_filter) 
+table(clust.crc_dat_filter)
+```
+```{r}
+deconv.crc_dat_filter <- calculateSumFactors(crc_dat_filter, cluster=clust.crc_dat_filter)
+summary(deconv.crc_dat_filter)
+```
+We use a pre-clustering step with quickCluster() where cells in each cluster are normalized separately and the size factors are rescaled to be comparable across clusters. This avoids the assumption that most genes are non-DE across the entire population - only a non-DE majority is required between pairs of clusters, which is a weaker assumption for highly heterogeneous populations. By default, quickCluster() will use an approximate algorithm for PCA based on methods from the irlba package. The approximation relies on stochastic initialization so we need to set the random seed (via set.seed()) for reproducibility.
+
+```{r}
+plot(lib.crc_dat_filter, deconv.crc_dat_filter, xlab="Library size factor",
+    ylab="Deconvolution size factor", log='xy', pch=16,
+    col=as.integer(factor(crc_dat_filter$batch)))
+abline(a=0, b=1, col="red")
+```
+# Next, we look at the logtransform
+
++ We apply the logNormCounts function from scater package
+
+```{r}
+crc_dat_filter <- logNormCounts(crc_dat_filter)
+assayNames(crc_dat_filter)
+```
+```{r}
+crc_dat_filter@assays@data$log2counts[1:10,1:10]
+```
+```{r}
+crc_dat_filter@assays@data$logcounts[1:10,1:10]
+```
+# Dimention reduction analysis
+
++ We perform the PCA on the log-normalized expression values using the runPCA() function from scater. By default, runPCA() will compute the first 50 PCs and store them in the reducedDims() of the output SingleCellExperiment object, as shown below. Here, we use only the top 2000 genes with the largest biological components to reduce both computational work and high-dimensional random noise. In particular, while PCA is robust to random noise, an excess of it may cause the earlier PCs to capture noise instead of biological structure (Johnstone and Lu 2009). This effect can be mitigated by restricting the PCA to a subset of HVGs
+
+```{r}
+library(scran)
+top.crc <- getTopHVGs(crc_dat_filter, n=2000)
+
+library(scater)
+set.seed(100) # See below.
+crc_dat_filter <- runPCA(crc_dat_filter, subset_row=top.crc) 
+reducedDimNames(crc_dat_filter)
+```
+```{r}
+dim(reducedDim(crc_dat_filter, "PCA"))
+```
+# How many PCs would we take? We can use the elbow method to find the number of PCs.
+```{r}
+library(PCAtools)
+percent.var <- attr(reducedDim(crc_dat_filter), "percentVar")
+plot(percent.var, log="y", xlab="PC", ylab="Variance explained (%)")
+chosen.elbow <- PCAtools::findElbowPoint(percent.var)
+chosen.elbow
+```
+
+```{r}
+plot(percent.var, xlab="PC", ylab="Variance explained (%)")
+abline(v=chosen.elbow, col="red")
+```
+
+
+```{r}
+plotReducedDim(crc_dat_filter, dimred="PCA", colour_by="batch")
+```
+# Next we will run UMAP on the top of PCs
+
+```{r}
+crc_dat_filter <- runUMAP(crc_dat_filter, pca = 20, ntop = 2000)
+plotReducedDim(crc_dat_filter, dimred="UMAP", colour_by="batch")
+```
+# Cluster by using k-mean method
+
+```{r}
+set.seed(100)
+clust.kmeans <- kmeans(reducedDim(crc_dat_filter, "PCA"), centers=15)
+table(clust.kmeans$cluster)
+```
+```{r}
+colLabels(crc_dat_filter) <- factor(clust.kmeans$cluster)
+plotReducedDim(crc_dat_filter, "UMAP", colour_by="label")
+```
+```{r}
+library(SingleR)
+
+```
+```{r}
+# celldex has many different type of cell identification, we use DatabaseImmuneCellExpressionData
+
+monaco.ref <- celldex::MonacoImmuneData()
+```
+# We predict cell types by using SingleR function. It will predict cell types by using library from MonacoImmuneData
+
+```{r}
+monaco.main <- SingleR(test = crc_dat_filter,assay.type.test = 1,ref = monaco.ref,labels = monaco.ref$label.main)
+```
+```{r}
+crc_dat_filter$cell_type <- factor(monaco.main$pruned.labels)
+```
+```{r}
+data.frame(colData(crc_dat_filter))
+```
+
+```{r}
+# colLabels(crc_dat_filter) <- factor(clust.kmeans$cluster)
+plotReducedDim(crc_dat_filter, "UMAP", colour_by="cell_type")
+```
+# Next, we would like to do DEseq analysis for cluster/cell_type analysis. Here, we are going to 
+
++ We need to create the count matrix and metadata for the counts
+
+## Create count matrix for each cluster/cell-type. Here, I am interested in the cell_types
+
+```{r}
+cell_ids <- purrr::set_names(levels(crc_dat_filter$cell_type))
+
+nc <- length(cell_ids) # number of cell types
+
+sam_ids <- purrr::set_names(levels(crc_dat_filter$batch_gid_dose))
+
+ns <- length(sam_ids)
+```
+
+# Getting number of cell per sample
+
+```{r}
+table(crc_dat_filter$batch_gid_dose)
+```
+```{r}
+n_cells <- as.numeric(table(crc_dat_filter$batch_gid_dose))
+m <- match(sam_ids, crc_dat_filter$batch_gid_dose)
+
+ei <- data.frame(colData(crc_dat_filter)[m, ], 
+                  n_cells, row.names = NULL) %>% dplyr::select(c(batch_gid_dose,batch, df.gid, dose, n_cells))
+ei
+names(ei)
+```
+```{r}
+library(Matrix.utils)
+# Subset metadata to only include the cluster and sample IDs to aggregate across
+groups <- colData(crc_dat_filter)[, c("cell_type", "batch_gid_dose")]
+
+pb <- aggregate.Matrix(t(counts(crc_dat_filter)), 
+                       groupings = groups, fun = "sum") 
+
+class(pb)
+
+dim(pb)
+
+pb[1:6,1:6]
+```
+
+We will split our data by cell type; however, not always do all samples contain cells of every cell type. To determine which samples are present for each cell type we can run the following:
+
+```{r}
+# Not every cluster is present in all samples; create a vector that represents how to split samples
+splitf <- sapply(stringr::str_split(rownames(pb), 
+                                    pattern = "_",  
+                                    n = 2), 
+                 `[`, 1)
+```
+
+```{r}
+# Turn into a list and split the list into components for each cluster and transform, so rows are genes and columns are samples and make rownames as the sample IDs
+library(magrittr)
+pb <- split.data.frame(pb, 
+                       factor(splitf)) %>%
+        lapply(function(u) 
+                set_colnames(t(u), 
+                             stringr::str_sub(rownames(u), str_locate(rownames(u),"_")[1]+1, -1)))
+
+class(pb)
+
+# Explore the different components of list
+str(pb)
+```
+
+```{r}
+# Print out the table of cells in each cluster-sample group
+options(width = 100)
+table(crc_dat_filter$cell_type, crc_dat_filter$batch_gid_dose)
+```
+
+Sample-level metadata
+
+```{r}
+# Get sample names for each of the cell type clusters
+
+# prep. data.frame for plotting
+get_sample_ids <- function(x){
+        pb[[x]] %>%
+                colnames()
+}
+
+de_samples <- map(1:nc, get_sample_ids) %>%
+        unlist()
+```
+
+```{r}
+pb[[3]]  %>%
+                colnames()
+```
+
+```{r}
+# Get cluster IDs for each of the samples
+
+samples_list <- purrr::map(1:nc, get_sample_ids)
+
+get_cluster_ids <- function(x){
+        rep(names(pb)[x], 
+            each = length(samples_list[[x]]))
+}
+
+de_cluster_ids <- purrr::map(1:nc, get_cluster_ids) %>%
+        unlist()
+
+
+```
+```{r}
+# Create a data frame with the sample IDs, cluster IDs and condition
+
+gg_df <- data.frame(cell_type = de_cluster_ids,
+                    batch_gid_dose = de_samples )
+
+gg_df <- left_join(gg_df, ei[, c("batch_gid_dose", "df.gid")]) 
+
+
+metadata <- gg_df %>%
+        dplyr::select(cell_type, batch_gid_dose, df.gid) %>% separate(col = batch_gid_dose, into = c("batch", "df.gid", "dose"), sep = "_", remove = FALSE)
+        
+metadata  
+```
+# Subsetting dataset to cell(s) of interest
+
+
+```{r}
+# Generate vector of cluster IDs
+clusters <- levels(factor(metadata$cell_type))
+clusters
+```
+```{r}
+# Subset the metadata to only the B cells
+cluster_metadata <- metadata[which(metadata$cell_type == clusters[1]), ]
+head(cluster_metadata)
+```
+```{r}
+# Assign the rownames of the metadata to be the sample IDs
+rownames(cluster_metadata) <- cluster_metadata$batch_gid_dose
+head(cluster_metadata)
+```
+
+```{r}
+# Run DESeq2 differential expression analysis
+dds <- DESeq(dds)
+```
+```{r}
+# Plot dispersion estimates
+plotDispEsts(dds)
+```
+
+
+
+```{r}
+# Subset the counts to only the B cells
+counts <- pb[[clusters[1]]]
+
+cluster_counts <- as.data.frame(counts[, which(colnames(counts) %in% rownames(cluster_metadata))])
+
+# Check that all of the row names of the metadata are the same and in the same order as the column names of the counts in order to use as input to DESeq2
+all(rownames(cluster_metadata) == colnames(cluster_counts))   
+```
+```{r}
+library(DESeq2)
+dds <- DESeqDataSetFromMatrix(cluster_counts, 
+                              colData = cluster_metadata, 
+                              design = ~  df.gid)
+```
+# Results from DESeq
+
+```{r}
+resultsNames(dds)
+```
+
+
+```{r}
+# Output results of Wald test for contrast for stim vs ctrl
+levels(factor(cluster_metadata$df.gid))[2]
+levels(factor(cluster_metadata$df.gid))[1]
+
+contrast <- c("df.gid", levels(factor(cluster_metadata$df.gid))[2], levels(factor(cluster_metadata$df.gid))[1])
+
+# resultsNames(dds)
+res <- results(dds, 
+               contrast = contrast,
+               alpha = 0.05)
+
+res <- lfcShrink(dds, 
+                 coef = 2,
+                 res=res)
+```
+```{r}
+# Turn the results object into a tibble for use with tidyverse functions
+res_tbl <- res %>%
+        data.frame() %>%
+        rownames_to_column(var="gene") %>%
+        as_tibble()
+
+# Check results output
+res_tbl
+
+# Write all results to file
+# write.csv(res_tbl,
+#           paste0("results/", clusters[1], "_", levels(cluster_metadata$sample)[2], "_vs_", levels(cluster_metadata$sample)[1], "_all_genes.csv"),
+#           quote = FALSE, 
+#           row.names = FALSE)
+```
+# Look for significant genes
+
+```{r}
+# Set thresholds
+padj_cutoff <- 0.05
+
+# Subset the significant results
+sig_res <- dplyr::filter(res_tbl, padj < padj_cutoff) %>%
+        dplyr::arrange(padj)
+
+# Check significant genes output
+sig_res
+```
+
